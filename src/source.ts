@@ -2,10 +2,10 @@ import path from 'node:path';
 import fse from 'fs-extra';
 import YAML from 'yaml';
 import { loadTeamConfig, autoDetectInit, loadLocalConfig, detectProjectConfig } from './config.js';
-import { createGit, pullRepo } from './utils/git.js';
+import { createGit } from './utils/git.js';
 import { parseFrontmatter } from './utils/frontmatter.js';
-import { detectProvider, getProvider } from './providers/index.js';
-import { log, spinner } from './utils/logger.js';
+import { ensureRepoCache } from './utils/external-repo-cache.js';
+import { log } from './utils/logger.js';
 import {
   pathExists,
   readFileSafe,
@@ -14,7 +14,6 @@ import {
   listDirs,
   copyDir,
   remove,
-  ensureDir,
 } from './utils/fs.js';
 import { getHandler } from './resources/index.js';
 import { ResourceHandler } from './resources/base.js';
@@ -55,60 +54,20 @@ async function saveSourceManifest(sourceName: string, manifest: SourceInstallMan
 }
 
 /**
- * Check if a source repo needs pulling based on TTL.
- * Returns true if the last pull was more than SOURCE_PULL_TTL_MS ago.
- */
-async function shouldPullSource(sourceName: string): Promise<boolean> {
-  const manifest = await loadSourceManifest(sourceName);
-  if (!manifest) return true;
-  const elapsed = Date.now() - new Date(manifest.lastPull).getTime();
-  return elapsed > SOURCE_PULL_TTL_MS;
-}
-
-/**
  * Clone or pull a source repo. Returns the repo path, or null on failure.
+ * Clone-or-pull-with-TTL is the shared `ensureRepoCache` primitive (also used
+ * by the DSH Team Context adapter); only the manifest shape and dir layout
+ * are source-specific.
  */
 async function ensureSourceRepo(source: SourceConfig, force: boolean): Promise<string | null> {
   const repoDir = getSourceRepoDir(source.name);
-
-  if (await pathExists(repoDir)) {
-    // Existing clone: pull if TTL expired or forced
-    if (!force && !(await shouldPullSource(source.name))) {
-      log.debug(`[source:${source.name}] Within pull TTL, skipping git pull`);
-      return repoDir;
-    }
-
-    try {
-      const result = await pullRepo(repoDir);
-      log.debug(`[source:${source.name}] Git pull: ${result}`);
-      return repoDir;
-    } catch (e) {
-      log.warn(`[source:${source.name}] Pull failed: ${(e as Error).message}`);
-      // Return existing repo even if pull fails (use cached version)
-      return repoDir;
-    }
-  }
-
-  // First time: clone via the provider so its configured authentication path
-  // (token, credential helper, or SSH agent) is used.
-  try {
-    await ensureDir(path.dirname(repoDir));
-    const cloneSpin = spinner(`[source:${source.name}] Cloning...`).start();
-
-    const providerName = detectProvider(source.repo);
-    const provider = getProvider(providerName);
-    const repoInfo = provider.parseRepoInput(source.repo);
-    const cloneTarget = provider.name === 'git'
-      ? repoInfo.httpsUrl
-      : `${repoInfo.owner}/${repoInfo.repo}`;
-    provider.cloneRepo(cloneTarget, repoDir);
-
-    cloneSpin.succeed(`[source:${source.name}] Cloned`);
-    return repoDir;
-  } catch (e) {
-    log.warn(`[source:${source.name}] Clone failed: ${(e as Error).message}`);
-    return null;
-  }
+  const manifest = await loadSourceManifest(source.name);
+  const result = await ensureRepoCache(repoDir, source.repo, manifest?.lastPull ?? null, {
+    force,
+    ttlMs: SOURCE_PULL_TTL_MS,
+    label: `source:${source.name}`,
+  });
+  return result ? repoDir : null;
 }
 
 // ─── Commands ────────────────────────────────────────────
@@ -619,7 +578,7 @@ async function extractSkillDescription(skillDir: string): Promise<string> {
 /**
  * Get the set of skill names that belong to the local team.
  */
-async function getLocalTeamSkillNames(teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<Set<string>> {
+export async function getLocalTeamSkillNames(teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<Set<string>> {
   const handler = getHandler('skills');
   const items = await handler.scanTeamForPull(teamConfig, localConfig);
   const names = new Set(items.map((i) => i.name));
@@ -633,7 +592,7 @@ async function getLocalTeamSkillNames(teamConfig: TeamaiConfig, localConfig: Loc
 /**
  * Remove a skill from all tool paths.
  */
-async function removeSkillFromToolPaths(skillName: string, teamConfig: TeamaiConfig, localConfig: LocalConfig, baseDir: string, installedPaths?: string[]): Promise<void> {
+export async function removeSkillFromToolPaths(skillName: string, teamConfig: TeamaiConfig, localConfig: LocalConfig, baseDir: string, installedPaths?: string[]): Promise<void> {
   if (installedPaths) {
     for (const installedPath of installedPaths) {
       const skillDir = path.resolve(baseDir, installedPath);
