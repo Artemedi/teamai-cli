@@ -2,7 +2,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import YAML from 'yaml';
 import { getUserHome } from './utils/home.js';
-import { ensureRepoCache, diffNameSets } from './utils/external-repo-cache.js';
+import { ensureRepoCache } from './utils/external-repo-cache.js';
 import { readJson, writeJson, readFileSafe, pathExists, listDirs, listFilesRecursive, copyDir } from './utils/fs.js';
 import { injectClaudeMdSection } from './utils/claudemd.js';
 import { log } from './utils/logger.js';
@@ -33,10 +33,14 @@ import {
 //  push/propose path here and none should ever be added without an explicit,
 //  human-reviewed upstream workflow (deferred, out of scope for v1).
 //
-//  Clone/pull-with-TTL and name-set diffing are the shared `external-repo-cache.ts`
-//  primitives (also used by source.ts's peer `sources`); everything below is
-//  specific to what a canonical Team Context repo contains and how each
-//  entity type resolves a collision against team-authored content.
+//  Clone/pull-with-TTL is the shared `ensureRepoCache` primitive (also used by
+//  source.ts's peer `sources`, so it lives in `utils/external-repo-cache.ts`).
+//  The skill tombstone name-set diff below stays local to this file: this
+//  adapter is its only current caller, so it isn't a shared utility (see
+//  docs/designs/dsh-team-context-v1.md's "Shared abstraction" note).
+//  Everything else below is specific to what a canonical Team Context repo
+//  contains and how each entity type resolves a collision against
+//  team-authored content.
 //
 //  Canonical entities are `skills/` and `governance/` only — the provider
 //  (dsh-team-context) deliberately does not publish a `rules/` entity
@@ -299,8 +303,12 @@ export async function materializeTeamContext(
   // Tombstone: anything we previously deployed that isn't deployed this run —
   // either removed upstream, or newly shadowed by a local skill. Either way
   // the canonical copy this adapter placed on disk no longer belongs there.
-  const skillDiff = diffNameSets(previousManifest?.skills ?? [], deployedSkills);
-  for (const name of skillDiff.removed) {
+  // (Feature-local name-set diff: this adapter is the only current caller of
+  // this shape, so it lives here rather than as a shared utils/ helper — see
+  // the "Shared abstraction" note in docs/designs/dsh-team-context-v1.md.)
+  const deployedSkillNames = new Set(deployedSkills);
+  const removedSkills = (previousManifest?.skills ?? []).filter((name) => !deployedSkillNames.has(name));
+  for (const name of removedSkills) {
     await removeSkillFromToolPaths(name, teamConfig, localConfig, baseDir, previousManifest?.skillPaths?.[name]);
   }
 
@@ -310,7 +318,7 @@ export async function materializeTeamContext(
   return {
     deployedSkills,
     skippedSkillsLocalOverride,
-    removedSkills: skillDiff.removed,
+    removedSkills,
     governanceInjected,
     skillPaths,
   };
