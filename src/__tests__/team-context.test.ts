@@ -32,6 +32,7 @@ import {
   getTeamContextRepoDir,
 } from '../team-context.js';
 import { getHandler } from '../resources/index.js';
+import { RESOURCE_TYPES } from '../types.js';
 import type { TeamaiConfig, LocalConfig } from '../types.js';
 
 const DSH_REPO_URL = 'git@example.com:acme/dsh-team-context.git';
@@ -205,6 +206,26 @@ describe('team-context', () => {
       const pushableSkills = await skillsHandler.scanLocalForPush(teamConfig, localConfig);
 
       expect(pushableSkills.some((i) => i.name === 'incident-response')).toBe(false);
+    });
+
+    it('materialized governance can never enter a promote/push/trainable path: no ResourceType handler ever surfaces it', async () => {
+      await seedUpstream();
+      await syncTeamContext(teamConfig, localConfig, {});
+
+      // Governance is deliberately NOT a ResourceType (types.ts's RESOURCE_TYPES
+      // is 'skills' | 'rules' | 'docs' | 'env' | 'agents' | 'hooks' | 'mcp') — it
+      // is only ever injected into CLAUDE.md, never read back as team-authored
+      // or optimizer-editable content. Pin that structurally: across every
+      // resource handler's own push-candidate scan, nothing derived from the
+      // governance block content or its CLAUDE.md markers ever appears.
+      for (const type of RESOURCE_TYPES) {
+        const handler = getHandler(type);
+        const candidates = await handler.scanLocalForPush(teamConfig, localConfig);
+        for (const item of candidates) {
+          expect(item.name).not.toContain('governance');
+          expect(item.relativePath).not.toContain('CLAUDE.md');
+        }
+      }
     });
 
     it('a local project cannot silently shadow governance: the block is fully regenerated from upstream every pull', async () => {
