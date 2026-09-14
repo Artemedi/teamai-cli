@@ -214,15 +214,18 @@ export const TEAMAI_SOURCES_DIR = path.join(getUserHome(), '.teamai', 'sources')
 
 // ─── DSH Team Context (canonical, read-only) ──────────────
 //
-//  Data flow (v0: read-only, DSH → TeamAI, no allow-list — everything under
-//  skills/, rules/, governance/ in the DSH repo is canonical published
-//  content; team-context.yaml is a contract/version file, not a filter):
+//  Data flow (v1: read-only, DSH → TeamAI, no allow-list — everything under
+//  skills/, governance/ in the DSH repo is canonical published content;
+//  team-context.yaml is a contract/version file, not a filter). There is no
+//  canonical `rules/` entity — the provider's own contract (dsh-team-context
+//  ADR-0006) deliberately does not publish one; a runtime-specific rule/policy
+//  surface is a consumer-side projection of `governance/`, not something this
+//  adapter materializes as a distinct entity:
 //
 //  DSH Team Context repo                    teamai.yaml (consumer team)
 //    team-context.yaml                        teamContext:
 //      schemaVersion: 1                          repo: <git-url>
 //    skills/<name>/SKILL.md
-//    rules/<name>.md
 //    governance/*.md
 //            │                                        │
 //            │              teamai pull                │
@@ -233,7 +236,6 @@ export const TEAMAI_SOURCES_DIR = path.join(getUserHome(), '.teamai', 'sources')
 //            ▼
 //  skills: local team skill of the same name wins (observable — logged +
 //          recorded as skipped in the manifest)
-//  rules: canonical always wins on name collision
 //  governance: always regenerated in full into a dedicated, non-optional
 //          CLAUDE.md block — no local config can disable or shadow it
 
@@ -247,10 +249,19 @@ export type TeamContextConfig = z.infer<typeof TeamContextConfigSchema>;
 /**
  * Contract version teamai supports for the DSH Team Context repo's own
  * `team-context.yaml` (declared at that repo's root, not in teamai.yaml).
- * An upstream repo declaring any other value fails loud and is never
+ * An upstream repo declaring any other value, or declaring any top-level
+ * field this version doesn't know about, fails loud and is never
  * materialized (see resolveTeamContextSnapshot in team-context.ts).
  */
 export const TEAM_CONTEXT_SCHEMA_VERSION = 1;
+
+/**
+ * Top-level fields the v1 contract recognizes in the upstream repo's
+ * `team-context.yaml`. Anything else present fails loud rather than being
+ * silently ignored, so a future provider-side field can never be
+ * misinterpreted by an older consumer.
+ */
+export const TEAM_CONTEXT_KNOWN_MANIFEST_FIELDS = new Set(['schemaVersion']);
 
 /** TTL for the Team Context repo pull: don't re-pull within this duration (ms). */
 export const TEAM_CONTEXT_PULL_TTL_MS = 24 * 60 * 60 * 1000;
@@ -259,8 +270,7 @@ export const TEAM_CONTEXT_PULL_TTL_MS = 24 * 60 * 60 * 1000;
  * Installed-content manifest for the DSH Team Context adapter. Persisted to
  * `~/.teamai/team-context/<hash>/installed.json`. Deliberately separate from
  * `SourceInstallManifest` — team-context has its own collision policy per
- * entity type and also tracks rules + governance, neither of which peer
- * `sources` support.
+ * entity type and also tracks governance, which peer `sources` don't support.
  */
 export interface TeamContextInstallManifest {
   /** ISO timestamp of last successful pull. */
@@ -271,8 +281,6 @@ export interface TeamContextInstallManifest {
   skills: string[];
   /** Per-skill deployment paths, relative to the configured scope root. */
   skillPaths?: Record<string, string[]>;
-  /** Canonical rule names currently deployed. */
-  rules: string[];
   /** Canonical governance file names last compiled into the CLAUDE.md block. */
   governanceFiles: string[];
 }
@@ -302,12 +310,12 @@ export const TeamaiConfigSchema = z.object({
   /** External team repos to pull skills from. Managed by team admin. */
   sources: z.array(SourceConfigSchema).optional(),
   /**
-   * The canonical DSH Team Context repo (org-wide shared skills/rules/
-   * governance). Team-level config only — deliberately not overridable from
+   * The canonical DSH Team Context repo (org-wide shared skills/governance).
+   * Team-level config only — deliberately not overridable from
    * per-user local config, since governance must not be locally disableable.
-   * v0 hardening gap: a team admin editing THIS field (e.g. removing it, or
+   * v1 hardening gap: a team admin editing THIS field (e.g. removing it, or
    * pointing it at a different repo) still works — that channel is not yet
-   * admin-enforced. Only per-user/local-config shadowing is closed in v0.
+   * admin-enforced. Only per-user/local-config shadowing is closed in v1.
    */
   teamContext: TeamContextConfigSchema.optional(),
   sharing: SharingConfigSchema.default({}),

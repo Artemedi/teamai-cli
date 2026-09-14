@@ -3,10 +3,9 @@ import { createHash } from 'node:crypto';
 import YAML from 'yaml';
 import { getUserHome } from './utils/home.js';
 import { ensureRepoCache, diffNameSets } from './utils/external-repo-cache.js';
-import { readJson, writeJson, readFileSafe, pathExists, listDirs, listFilesRecursive, copyDir, remove } from './utils/fs.js';
+import { readJson, writeJson, readFileSafe, pathExists, listDirs, listFilesRecursive, copyDir } from './utils/fs.js';
 import { injectClaudeMdSection } from './utils/claudemd.js';
 import { log } from './utils/logger.js';
-import { getHandler } from './resources/index.js';
 import { ResourceHandler } from './resources/base.js';
 import {
   resolveSkillDestination,
@@ -14,30 +13,38 @@ import {
   getLocalTeamSkillNames,
   removeSkillFromToolPaths,
 } from './resources/skills.js';
-import { ruleFileExtensionForTool } from './resources/rule-format.js';
-import type { TeamaiConfig, LocalConfig, GlobalOptions, ResourceItem, TeamContextInstallManifest } from './types.js';
+import type { TeamaiConfig, LocalConfig, GlobalOptions, TeamContextInstallManifest } from './types.js';
 import {
   resolveBaseDir,
   scopedToolPaths,
   isAgentExcluded,
   TEAM_CONTEXT_SCHEMA_VERSION,
+  TEAM_CONTEXT_KNOWN_MANIFEST_FIELDS,
   TEAM_CONTEXT_PULL_TTL_MS,
   TEAMAI_TEAM_CONTEXT_GOVERNANCE_START,
   TEAMAI_TEAM_CONTEXT_GOVERNANCE_END,
 } from './types.js';
 
-// ─── DSH Team Context adapter (v0, read-only) ─────────────
+// ─── DSH Team Context adapter (v1, read-only) ─────────────
 //
 //  See types.ts's "DSH Team Context (canonical, read-only)" comment for the
 //  data-flow diagram. This module is the entire adapter: pull the upstream
 //  clone, validate+resolve a full snapshot, then materialize it. There is no
 //  push/propose path here and none should ever be added without an explicit,
-//  human-reviewed upstream workflow (deferred, out of scope for v0).
+//  human-reviewed upstream workflow (deferred, out of scope for v1).
 //
 //  Clone/pull-with-TTL and name-set diffing are the shared `external-repo-cache.ts`
 //  primitives (also used by source.ts's peer `sources`); everything below is
 //  specific to what a canonical Team Context repo contains and how each
 //  entity type resolves a collision against team-authored content.
+//
+//  Canonical entities are `skills/` and `governance/` only — the provider
+//  (dsh-team-context) deliberately does not publish a `rules/` entity
+//  (ADR-0006): a runtime-specific rule/policy surface, if one is ever needed,
+//  is a consumer-side projection of `governance/` content, not a distinct
+//  thing this adapter pulls or materializes. TeamAI's own pre-existing,
+//  team-authored `rules/` capability (source.ts, resources/rules.ts) is
+//  entirely unaffected — it has nothing to do with Team Context.
 
 /** A resolved item ready to deploy: its canonical name and its path inside the upstream clone. */
 interface ResolvedItem {
@@ -49,7 +56,6 @@ interface ResolvedItem {
 export interface TeamContextSnapshot {
   schemaVersion: number;
   skills: ResolvedItem[];
-  rules: ResolvedItem[];
   governanceFiles: ResolvedItem[];
 }
 
@@ -58,8 +64,6 @@ export interface TeamContextMaterializeResult {
   /** Skills NOT deployed because a local team-authored skill has the same name (local-wins, observable). */
   skippedSkillsLocalOverride: string[];
   removedSkills: string[];
-  deployedRules: string[];
-  removedRules: string[];
   governanceInjected: boolean;
   skillPaths: Record<string, string[]>;
 }
@@ -90,7 +94,7 @@ async function saveTeamContextManifest(repoUrl: string, manifest: TeamContextIns
 }
 
 /**
- * Read `<repoDir>/skills/<name>/SKILL.md` entries. Flat layout only in v0 —
+ * Read `<repoDir>/skills/<name>/SKILL.md` entries. Flat layout only in v1 —
  * a canonical, org-wide repo has no role/project namespace concept yet
  * (namespace-aware resolve is deferred); a directory without SKILL.md is
  * skipped rather than treated as a namespace.
@@ -105,19 +109,10 @@ async function listCanonicalSkills(repoDir: string): Promise<ResolvedItem[]> {
     if (await pathExists(path.join(dir, 'SKILL.md'))) {
       items.push({ name, sourcePath: dir });
     } else {
-      log.debug(`[team-context] Skipping "skills/${name}": no SKILL.md (namespaced skills are not supported in v0)`);
+      log.debug(`[team-context] Skipping "skills/${name}": no SKILL.md (namespaced skills are not supported in v1)`);
     }
   }
   return items;
-}
-
-/** Read `<repoDir>/rules/*.md` (recursively, so subdirectories are supported like team rules). */
-async function listCanonicalRules(repoDir: string): Promise<ResolvedItem[]> {
-  const rulesDir = path.join(repoDir, 'rules');
-  if (!await pathExists(rulesDir)) return [];
-
-  const files = (await listFilesRecursive(rulesDir)).filter((f) => f.endsWith('.md'));
-  return files.map((f) => ({ name: f.slice(0, -'.md'.length), sourcePath: path.join(rulesDir, f) }));
 }
 
 /** Read `<repoDir>/governance/*.md`, sorted for a deterministic compiled block. */
@@ -132,12 +127,16 @@ async function listCanonicalGovernanceFiles(repoDir: string): Promise<ResolvedIt
 /**
  * Validate the upstream repo's contract and resolve everything it publishes
  * into one in-memory snapshot. Throws (rather than returning a partial
- * result) on a missing or unsupported `team-context.yaml` — the caller MUST
- * treat a thrown error as "do not materialize, leave local state untouched",
- * which is what makes an invalid/incompatible upstream unable to leave
- * partial or tombstoned local state.
+ * result) on a missing, malformed, or unsupported `team-context.yaml` — the
+ * caller MUST treat a thrown error as "do not materialize, leave local state
+ * untouched", which is what makes an invalid/incompatible upstream unable to
+ * leave partial or tombstoned local state.
  *
- * No allow-list: everything under skills/, rules/, governance/ is canonical
+ * Validation is strict, not just version-gated: an unknown top-level field
+ * fails loud too, so a future provider-side contract field can never be
+ * silently ignored by an older consumer that doesn't understand it yet.
+ *
+ * No allow-list: everything under skills/, governance/ is canonical
  * published content (unlike peer `sources`, which gate on `publicSkills`).
  */
 export async function resolveTeamContextSnapshot(repoDir: string): Promise<TeamContextSnapshot> {
@@ -157,7 +156,11 @@ export async function resolveTeamContextSnapshot(repoDir: string): Promise<TeamC
     throw new Error(`DSH Team Context team-context.yaml is not valid YAML: ${(e as Error).message}`);
   }
 
-  const schemaVersion = (parsed as { schemaVersion?: unknown } | null)?.schemaVersion;
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('DSH Team Context team-context.yaml must be a YAML mapping at its root. Refusing to materialize.');
+  }
+
+  const schemaVersion = (parsed as { schemaVersion?: unknown }).schemaVersion;
   if (schemaVersion !== TEAM_CONTEXT_SCHEMA_VERSION) {
     throw new Error(
       `DSH Team Context team-context.yaml declares unsupported schemaVersion `
@@ -166,13 +169,20 @@ export async function resolveTeamContextSnapshot(repoDir: string): Promise<TeamC
     );
   }
 
-  const [skills, rules, governanceFiles] = await Promise.all([
+  const unknownFields = Object.keys(parsed).filter((key) => !TEAM_CONTEXT_KNOWN_MANIFEST_FIELDS.has(key));
+  if (unknownFields.length > 0) {
+    throw new Error(
+      `DSH Team Context team-context.yaml declares unknown top-level field(s): `
+      + `${unknownFields.join(', ')}. Refusing to materialize.`,
+    );
+  }
+
+  const [skills, governanceFiles] = await Promise.all([
     listCanonicalSkills(repoDir),
-    listCanonicalRules(repoDir),
     listCanonicalGovernanceFiles(repoDir),
   ]);
 
-  return { schemaVersion, skills, rules, governanceFiles };
+  return { schemaVersion, skills, governanceFiles };
 }
 
 /** governance/*.md concatenated into one deterministic, always-present block. */
@@ -234,41 +244,18 @@ async function injectGovernanceBlock(
   return injected;
 }
 
-/** Remove a canonical rule (not a team-authored one — no tombstone, no team-repo write) from every tool's rules dir. */
-async function removeCanonicalRuleFromToolPaths(
-  name: string,
-  teamConfig: TeamaiConfig,
-  localConfig: LocalConfig,
-  baseDir: string,
-): Promise<void> {
-  for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
-    if (!toolPath.rules) continue;
-    for (const ext of new Set([ruleFileExtensionForTool(tool), '.md'])) {
-      const filePath = path.join(baseDir, toolPath.rules, `${name}${ext}`);
-      if (await pathExists(filePath)) {
-        await remove(filePath);
-        log.debug(`[team-context] Removed canonical rule ${name} from ${tool}`);
-      }
-    }
-  }
-}
-
 /**
  * Deploy a validated, already-resolved snapshot. Callers MUST only call this
  * after `resolveTeamContextSnapshot` succeeded — never on a partially-read or
  * unvalidated upstream state.
  *
- * Collision policy (deliberately asymmetric, not a single "local wins"):
+ * Collision policy:
  *  - skills: a local team-authored skill of the same name wins; the
  *    canonical copy is skipped, logged (log.warn, not debug — must be
  *    observable), and reported in the result.
- *  - rules: canonical always wins. Deployed unconditionally, which — because
- *    this runs after the per-scope team-rule sync in `pull()` — deterministically
- *    overwrites a same-named team rule at its tool-dir location. There is no
- *    per-item check here: ordering in pull.ts is what guarantees this, and
- *    the acceptance test pins the outcome rather than the ordering.
  *  - governance: always regenerated in full (see injectGovernanceBlock);
- *    no collision concept applies.
+ *    no collision concept applies — there is no local-authored governance
+ *    content it could collide with.
  */
 export async function materializeTeamContext(
   snapshot: TeamContextSnapshot,
@@ -317,25 +304,6 @@ export async function materializeTeamContext(
     await removeSkillFromToolPaths(name, teamConfig, localConfig, baseDir, previousManifest?.skillPaths?.[name]);
   }
 
-  // ---- rules: canonical wins by default ----
-  const rulesHandler = getHandler('rules');
-  const deployedRules: string[] = [];
-  for (const rule of snapshot.rules) {
-    const item: ResourceItem = {
-      name: rule.name,
-      type: 'rules',
-      sourcePath: rule.sourcePath,
-      relativePath: `rules/${rule.name}.md`,
-    };
-    await rulesHandler.pullItem(item, teamConfig, localConfig);
-    deployedRules.push(rule.name);
-  }
-
-  const ruleDiff = diffNameSets(previousManifest?.rules ?? [], deployedRules);
-  for (const name of ruleDiff.removed) {
-    await removeCanonicalRuleFromToolPaths(name, teamConfig, localConfig, baseDir);
-  }
-
   // ---- governance: authoritative, always regenerated in full ----
   const governanceInjected = await injectGovernanceBlock(snapshot.governanceFiles, teamConfig, localConfig, baseDir);
 
@@ -343,8 +311,6 @@ export async function materializeTeamContext(
     deployedSkills,
     skippedSkillsLocalOverride,
     removedSkills: skillDiff.removed,
-    deployedRules,
-    removedRules: ruleDiff.removed,
     governanceInjected,
     skillPaths,
   };
@@ -354,13 +320,16 @@ export async function materializeTeamContext(
  * Full pull cycle for the team's configured Team Context (if any): clone/pull
  * (best-effort, cached, TTL-gated), then validate+resolve the ENTIRE snapshot
  * before touching any local state, then materialize. A missing `teamContext`
- * config is a silent no-op (most teams won't have one in v0).
+ * config is a silent no-op (most teams won't have one in v1) — this is the
+ * "unavailable" half of the availability/authority split (dsh-team-context
+ * ADR-0007): no `teamContext` configured, or the repo being unreachable, must
+ * never stop the rest of `teamai pull` from working.
  *
- * Invalid/incompatible upstream (bad or missing team-context.yaml) fails
- * loud via `log.error` and returns WITHOUT calling materialize — previously
- * materialized skills/rules/governance and the manifest are left exactly as
- * they were, so a broken upstream can never leave partial or tombstoned
- * local state.
+ * Invalid/incompatible upstream (bad, missing, or unrecognized-shape
+ * team-context.yaml) fails loud via `log.error` and returns WITHOUT calling
+ * materialize — previously materialized skills/governance and the manifest
+ * are left exactly as they were, so a broken upstream can never leave
+ * partial or tombstoned local state.
  */
 export async function syncTeamContext(
   teamConfig: TeamaiConfig,
@@ -396,7 +365,7 @@ export async function syncTeamContext(
   if (options.dryRun) {
     log.info(
       `[dry-run] [team-context] Would sync ${snapshot.skills.length} skill(s), `
-      + `${snapshot.rules.length} rule(s), ${snapshot.governanceFiles.length} governance file(s)`,
+      + `${snapshot.governanceFiles.length} governance file(s)`,
     );
     return;
   }
@@ -408,13 +377,11 @@ export async function syncTeamContext(
     schemaVersion: snapshot.schemaVersion,
     skills: result.deployedSkills,
     skillPaths: result.skillPaths,
-    rules: result.deployedRules,
     governanceFiles: snapshot.governanceFiles.map((f) => f.name),
   });
 
   const parts: string[] = [];
   if (result.deployedSkills.length > 0) parts.push(`${result.deployedSkills.length} skill(s)`);
-  if (result.deployedRules.length > 0) parts.push(`${result.deployedRules.length} rule(s)`);
   if (result.governanceInjected) parts.push('governance');
   if (parts.length > 0) {
     log.success(`[team-context] Synced ${parts.join(', ')}`);
@@ -425,21 +392,21 @@ export async function syncTeamContext(
 }
 
 /**
- * Names of skills/rules currently deployed from the team's Team Context, per
- * its own install manifest. Used by `scanLocalForPush` (skills.ts, rules.ts)
- * to exclude canonical content from push candidates — the same shape as
- * source.ts's `getAllSourceSkillNames`, but scoped to the team's single
- * configured `teamContext` instead of scanning every cached peer source.
+ * Canonical skill names currently deployed from the team's Team Context, per
+ * its own install manifest. Used by `scanLocalForPush` (skills.ts) to exclude
+ * canonical content from push candidates — the same shape as source.ts's
+ * `getAllSourceSkillNames`, but scoped to the team's single configured
+ * `teamContext` instead of scanning every cached peer source.
+ *
+ * Skills-only: Team Context has no canonical `rules` entity (see the module
+ * comment above), so there is nothing else here that could ever be pushed.
  */
-export async function getTeamContextItemNames(
-  teamConfig: TeamaiConfig,
-  type: 'skills' | 'rules',
-): Promise<Set<string>> {
+export async function getTeamContextSkillNames(teamConfig: TeamaiConfig): Promise<Set<string>> {
   const repoUrl = teamConfig.teamContext?.repo;
   if (!repoUrl) return new Set();
 
   const manifest = await loadTeamContextManifest(repoUrl);
   if (!manifest) return new Set();
 
-  return new Set(type === 'skills' ? manifest.skills : manifest.rules);
+  return new Set(manifest.skills);
 }

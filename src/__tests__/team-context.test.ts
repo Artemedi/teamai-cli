@@ -28,7 +28,7 @@ import {
   resolveTeamContextSnapshot,
   materializeTeamContext,
   syncTeamContext,
-  getTeamContextItemNames,
+  getTeamContextSkillNames,
   getTeamContextRepoDir,
 } from '../team-context.js';
 import { getHandler } from '../resources/index.js';
@@ -86,13 +86,13 @@ describe('team-context', () => {
     await fse.remove(tmpDir);
   });
 
-  /** Populate the fake upstream DSH repo with one skill, one rule, one governance file. */
+  /** Populate the fake upstream DSH repo with one skill and one governance file. No `rules/` — Team Context has no canonical rules entity (ADR-0006). */
   async function seedUpstream(opts: {
     schemaVersion?: number | string;
     skillContent?: string;
-    ruleContent?: string;
     governanceContent?: string;
     omitContractFile?: boolean;
+    extraManifestYaml?: string;
   } = {}): Promise<void> {
     await fse.remove(dshRepoDir);
     await fse.ensureDir(dshRepoDir);
@@ -100,7 +100,7 @@ describe('team-context', () => {
     if (!opts.omitContractFile) {
       await fse.writeFile(
         path.join(dshRepoDir, 'team-context.yaml'),
-        `schemaVersion: ${opts.schemaVersion ?? 1}\n`,
+        `schemaVersion: ${opts.schemaVersion ?? 1}\n${opts.extraManifestYaml ?? ''}`,
       );
     }
 
@@ -108,12 +108,6 @@ describe('team-context', () => {
     await fse.writeFile(
       path.join(dshRepoDir, 'skills', 'incident-response', 'SKILL.md'),
       opts.skillContent ?? '---\nname: incident-response\ndescription: canonical\n---\n# Canonical skill',
-    );
-
-    await fse.ensureDir(path.join(dshRepoDir, 'rules'));
-    await fse.writeFile(
-      path.join(dshRepoDir, 'rules', 'security-baseline.md'),
-      opts.ruleContent ?? '# Canonical rule\nAlways do X.',
     );
 
     await fse.ensureDir(path.join(dshRepoDir, 'governance'));
@@ -134,41 +128,61 @@ describe('team-context', () => {
       await expect(resolveTeamContextSnapshot(dshRepoDir)).rejects.toThrow(/unsupported schemaVersion/);
     });
 
-    it('resolves skills, rules, and governance files for a valid v1 repo', async () => {
+    it('throws on an unknown top-level manifest field, before any local write', async () => {
+      await seedUpstream({ extraManifestYaml: 'rules: true\n' });
+      await expect(resolveTeamContextSnapshot(dshRepoDir)).rejects.toThrow(/unknown top-level field/);
+    });
+
+    it('throws when team-context.yaml is not a YAML mapping', async () => {
+      await fse.remove(dshRepoDir);
+      await fse.ensureDir(dshRepoDir);
+      await fse.writeFile(path.join(dshRepoDir, 'team-context.yaml'), '- not\n- a\n- mapping\n');
+      await expect(resolveTeamContextSnapshot(dshRepoDir)).rejects.toThrow(/must be a YAML mapping/);
+    });
+
+    it('resolves skills and governance files for a valid v1 repo, with no rules entity', async () => {
       await seedUpstream();
       const snapshot = await resolveTeamContextSnapshot(dshRepoDir);
       expect(snapshot.schemaVersion).toBe(1);
       expect(snapshot.skills.map((s) => s.name)).toEqual(['incident-response']);
-      expect(snapshot.rules.map((r) => r.name)).toEqual(['security-baseline']);
+      expect(snapshot.governanceFiles.map((g) => g.name)).toEqual(['policy.md']);
+      expect(snapshot).not.toHaveProperty('rules');
+    });
+
+    it('ignores a canonical rules/ directory upstream — it is not a recognized entity', async () => {
+      await seedUpstream();
+      await fse.ensureDir(path.join(dshRepoDir, 'rules'));
+      await fse.writeFile(path.join(dshRepoDir, 'rules', 'security-baseline.md'), '# Not canonical');
+
+      const snapshot = await resolveTeamContextSnapshot(dshRepoDir);
+      expect(snapshot.skills.map((s) => s.name)).toEqual(['incident-response']);
       expect(snapshot.governanceFiles.map((g) => g.name)).toEqual(['policy.md']);
     });
   });
 
   describe('acceptance: canonical content follows upstream, never leaks into push, governance cannot be shadowed', () => {
-    it('materializes skill + rule + governance on first pull', async () => {
+    it('materializes skill + governance on first pull', async () => {
       await seedUpstream();
       await syncTeamContext(teamConfig, localConfig, {});
 
       expect(await fse.pathExists(path.join(homeDir, '.claude', 'skills', 'incident-response', 'SKILL.md'))).toBe(true);
-      expect(await fse.readFile(path.join(homeDir, '.claude', 'rules', 'security-baseline.md'), 'utf-8'))
-        .toContain('Canonical rule');
       const claudeMd = await fse.readFile(path.join(homeDir, '.claude', 'CLAUDE.md'), 'utf-8');
       expect(claudeMd).toContain('Team Context Governance');
       expect(claudeMd).toContain('All changes require review.');
     });
 
-    it('propagates an upstream content update on the next pull', async () => {
+    it('propagates an upstream skill update on the next pull', async () => {
       await seedUpstream();
       await syncTeamContext(teamConfig, localConfig, {});
 
-      await seedUpstream({ ruleContent: '# Canonical rule\nUpdated: always do Y now.' });
+      await seedUpstream({ skillContent: '---\nname: incident-response\ndescription: canonical\n---\n# Updated canonical skill' });
       await syncTeamContext(teamConfig, localConfig, {});
 
-      const rule = await fse.readFile(path.join(homeDir, '.claude', 'rules', 'security-baseline.md'), 'utf-8');
-      expect(rule).toContain('Updated: always do Y now.');
+      const skill = await fse.readFile(path.join(homeDir, '.claude', 'skills', 'incident-response', 'SKILL.md'), 'utf-8');
+      expect(skill).toContain('Updated canonical skill');
     });
 
-    it('removes a skill and a rule locally once upstream drops them (tombstone-on-diff)', async () => {
+    it('removes a skill locally once upstream drops it (tombstone-on-diff)', async () => {
       await seedUpstream();
       await syncTeamContext(teamConfig, localConfig, {});
       expect(await fse.pathExists(path.join(homeDir, '.claude', 'skills', 'incident-response'))).toBe(true);
@@ -181,20 +195,16 @@ describe('team-context', () => {
       await syncTeamContext(teamConfig, localConfig, {});
 
       expect(await fse.pathExists(path.join(homeDir, '.claude', 'skills', 'incident-response'))).toBe(false);
-      expect(await fse.pathExists(path.join(homeDir, '.claude', 'rules', 'security-baseline.md'))).toBe(false);
     });
 
-    it('never surfaces canonical skills or rules as push candidates', async () => {
+    it('never surfaces canonical skills as push candidates', async () => {
       await seedUpstream();
       await syncTeamContext(teamConfig, localConfig, {});
 
       const skillsHandler = getHandler('skills');
-      const rulesHandler = getHandler('rules');
       const pushableSkills = await skillsHandler.scanLocalForPush(teamConfig, localConfig);
-      const pushableRules = await rulesHandler.scanLocalForPush(teamConfig, localConfig);
 
       expect(pushableSkills.some((i) => i.name === 'incident-response')).toBe(false);
-      expect(pushableRules.some((i) => i.name === 'security-baseline')).toBe(false);
     });
 
     it('a local project cannot silently shadow governance: the block is fully regenerated from upstream every pull', async () => {
@@ -232,15 +242,43 @@ describe('team-context', () => {
     it('an invalid upstream schemaVersion fails loud and leaves previously materialized state untouched', async () => {
       await seedUpstream();
       await syncTeamContext(teamConfig, localConfig, {});
-      const before = await fse.readFile(path.join(homeDir, '.claude', 'rules', 'security-baseline.md'), 'utf-8');
+      const before = await fse.readFile(path.join(homeDir, '.claude', 'skills', 'incident-response', 'SKILL.md'), 'utf-8');
 
-      await seedUpstream({ schemaVersion: 99, ruleContent: '# This must never land\n' });
+      await seedUpstream({ schemaVersion: 99, skillContent: '---\nname: incident-response\n---\n# This must never land' });
       await syncTeamContext(teamConfig, localConfig, {});
 
-      const after = await fse.readFile(path.join(homeDir, '.claude', 'rules', 'security-baseline.md'), 'utf-8');
+      const after = await fse.readFile(path.join(homeDir, '.claude', 'skills', 'incident-response', 'SKILL.md'), 'utf-8');
       expect(after).toBe(before);
       expect(after).not.toContain('This must never land');
       expect(log.error).toHaveBeenCalledWith(expect.stringContaining('unsupported schemaVersion'));
+    });
+
+    it('an upstream manifest with an unknown top-level field fails loud and leaves previously materialized state untouched', async () => {
+      await seedUpstream();
+      await syncTeamContext(teamConfig, localConfig, {});
+      const before = await fse.readFile(path.join(homeDir, '.claude', 'skills', 'incident-response', 'SKILL.md'), 'utf-8');
+
+      await seedUpstream({
+        extraManifestYaml: 'rules: true\n',
+        skillContent: '---\nname: incident-response\n---\n# This must never land',
+      });
+      await syncTeamContext(teamConfig, localConfig, {});
+
+      const after = await fse.readFile(path.join(homeDir, '.claude', 'skills', 'incident-response', 'SKILL.md'), 'utf-8');
+      expect(after).toBe(before);
+      expect(after).not.toContain('This must never land');
+      expect(log.error).toHaveBeenCalledWith(expect.stringContaining('unknown top-level field'));
+    });
+  });
+
+  describe('graceful degradation when Team Context is unavailable', () => {
+    it('an unresolvable repo URL on first pull is skipped without throwing, and does not break the rest of the sync', async () => {
+      await fse.remove(dshRepoDir); // no prior clone on disk
+      const unresolvable = { ...teamConfig, teamContext: { repo: 'not-a-real-host::acme/dsh-team-context' } };
+
+      await expect(syncTeamContext(unresolvable as unknown as TeamaiConfig, localConfig, {})).resolves.toBeUndefined();
+      expect(await fse.pathExists(path.join(homeDir, '.claude', 'skills', 'incident-response'))).toBe(false);
+      expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('Could not access the DSH Team Context repo'));
     });
   });
 
@@ -271,26 +309,8 @@ describe('team-context', () => {
       expect(deployed).toBe('# Local team version');
       expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('overrides the canonical Team Context skill'));
 
-      const names = await getTeamContextItemNames(teamConfig, 'skills');
+      const names = await getTeamContextSkillNames(teamConfig);
       expect(names.has('incident-response')).toBe(false);
-    });
-  });
-
-  describe('rules: canonical wins by default', () => {
-    it('overwrites a same-named local team rule at its tool-dir location', async () => {
-      await seedUpstream();
-      // A team rule with the SAME name already deployed to the tool dir (as if
-      // pullForScope's team-rule sync had already run this pull cycle).
-      await fse.writeFile(
-        path.join(homeDir, '.claude', 'rules', 'security-baseline.md'),
-        '# Team-authored version (should be overwritten)',
-      );
-
-      await syncTeamContext(teamConfig, localConfig, {});
-
-      const content = await fse.readFile(path.join(homeDir, '.claude', 'rules', 'security-baseline.md'), 'utf-8');
-      expect(content).toContain('Canonical rule');
-      expect(content).not.toContain('Team-authored version');
     });
   });
 
@@ -300,7 +320,6 @@ describe('team-context', () => {
       await syncTeamContext(teamConfig, localConfig, { dryRun: true });
 
       expect(await fse.pathExists(path.join(homeDir, '.claude', 'skills', 'incident-response'))).toBe(false);
-      expect(await fse.pathExists(path.join(homeDir, '.claude', 'rules', 'security-baseline.md'))).toBe(false);
     });
   });
 
@@ -312,17 +331,17 @@ describe('team-context', () => {
   });
 
   describe('materializeTeamContext (unit)', () => {
-    it('returns per-entity manifests instead of a single undifferentiated result', async () => {
+    it('returns a skills + governance manifest, with no rules field', async () => {
       await seedUpstream();
       const snapshot = await resolveTeamContextSnapshot(dshRepoDir);
       const result = await materializeTeamContext(snapshot, teamConfig, localConfig, null);
 
       expect(result.deployedSkills).toEqual(['incident-response']);
-      expect(result.deployedRules).toEqual(['security-baseline']);
       expect(result.governanceInjected).toBe(true);
       expect(result.skippedSkillsLocalOverride).toEqual([]);
       expect(result.removedSkills).toEqual([]);
-      expect(result.removedRules).toEqual([]);
+      expect(result).not.toHaveProperty('deployedRules');
+      expect(result).not.toHaveProperty('removedRules');
     });
   });
 });

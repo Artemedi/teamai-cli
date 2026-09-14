@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 
-// ─── DSH Team Context v0 end-to-end acceptance test ────────────────────────
+// ─── DSH Team Context v1 end-to-end acceptance test ────────────────────────
 //
 // Drives the real, built CLI binary against three offline local git fixture
 // repos (a DSH Team Context "upstream", a team repo that subscribes to it,
@@ -16,13 +16,20 @@ import { fileURLToPath } from 'node:url';
 //
 // Proves, across a sequence of real `teamai pull`/`push` invocations with the
 // DSH origin mutated in between:
-//   1. initial pull materializes skill + rule + governance
-//   2. an upstream content update propagates on the next pull
-//   3. an upstream deletion tombstones the canonical skill + rule locally
+//   1. initial pull materializes skill + governance
+//   2. an upstream skill content update propagates on the next pull
+//   3. an upstream deletion tombstones the canonical skill locally
 //   4. a hand-edit inside the governance markers is reverted by the next pull
-//   5. `push --dry-run` never picks up canonical skill/rule content
+//   5. `push --dry-run` never picks up canonical skill content
 //   6. an invalid upstream schemaVersion fails loud and leaves the previous
-//      valid state (skill/rule/governance) completely unchanged
+//      valid state (skill/governance) completely unchanged
+//   7. an unknown top-level manifest field fails loud the same way
+//
+// There is deliberately no "canonical rules" scenario: DSH Team Context does
+// not publish a `rules/` entity (dsh-team-context ADR-0006) — a runtime rule
+// surface, if needed, is a consumer-side projection of `governance/`, not a
+// distinct canonical thing. TeamAI's own pre-existing, team-authored `rules/`
+// capability is unrelated to this adapter and is not exercised here.
 //
 // The DSH repo's cache dir is seeded via a direct `git clone` (bypassing
 // teamai's git-provider abstraction, which — like the pre-existing peer
@@ -77,7 +84,7 @@ function teamContextRepoDir(homeDir: string, dshRemote: string): string {
   return path.join(homeDir, '.teamai', 'team-context', hash, 'repo');
 }
 
-const SKILL_MD = [
+const SKILL_MD_ORIGINAL = [
   '---',
   'name: incident-response',
   'description: canonical incident response playbook',
@@ -86,28 +93,44 @@ const SKILL_MD = [
   '',
 ].join('\n');
 
-const RULE_MD_ORIGINAL = '# Canonical security rule\nAlways rotate credentials after an incident.\n';
-const RULE_MD_UPDATED = '# Canonical security rule\nUPDATED: rotate credentials within 1 hour.\n';
-const RULE_MD_INVALID = '# THIS MUST NEVER LAND LOCALLY\n';
+const SKILL_MD_UPDATED = [
+  '---',
+  'name: incident-response',
+  'description: canonical incident response playbook',
+  '---',
+  '# Canonical incident response (UPDATED: escalate within 15 minutes)',
+  '',
+].join('\n');
+
+const SKILL_MD_INVALID = [
+  '---',
+  'name: incident-response',
+  '---',
+  '# THIS MUST NEVER LAND LOCALLY',
+  '',
+].join('\n');
+
 const GOVERNANCE_MD = 'All production changes require two reviewers.\n';
 const GOVERNANCE_TAMPERED_MARKER = 'Reviews are optional now (tampered).';
 
-function writeDshFixture(dir: string, opts: { schemaVersion?: number; ruleContent?: string; includeSkillAndRule?: boolean } = {}): void {
-  const { schemaVersion = 1, ruleContent = RULE_MD_ORIGINAL, includeSkillAndRule = true } = opts;
+function writeDshFixture(dir: string, opts: {
+  manifestExtra?: string;
+  schemaVersion?: number;
+  skillContent?: string;
+  includeSkill?: boolean;
+} = {}): void {
+  const { schemaVersion = 1, skillContent = SKILL_MD_ORIGINAL, includeSkill = true, manifestExtra = '' } = opts;
   fs.rmSync(path.join(dir, 'skills'), { recursive: true, force: true });
-  fs.rmSync(path.join(dir, 'rules'), { recursive: true, force: true });
-  fs.writeFileSync(path.join(dir, 'team-context.yaml'), `schemaVersion: ${schemaVersion}\n`);
+  fs.writeFileSync(path.join(dir, 'team-context.yaml'), `schemaVersion: ${schemaVersion}\n${manifestExtra}`);
   fs.mkdirSync(path.join(dir, 'governance'), { recursive: true });
   fs.writeFileSync(path.join(dir, 'governance', 'policy.md'), GOVERNANCE_MD);
-  if (includeSkillAndRule) {
+  if (includeSkill) {
     fs.mkdirSync(path.join(dir, 'skills', 'incident-response'), { recursive: true });
-    fs.writeFileSync(path.join(dir, 'skills', 'incident-response', 'SKILL.md'), SKILL_MD);
-    fs.mkdirSync(path.join(dir, 'rules'), { recursive: true });
-    fs.writeFileSync(path.join(dir, 'rules', 'security-baseline.md'), ruleContent);
+    fs.writeFileSync(path.join(dir, 'skills', 'incident-response', 'SKILL.md'), skillContent);
   }
 }
 
-describe('DSH Team Context v0 e2e (real CLI, real local git, no network)', () => {
+describe('DSH Team Context v1 e2e (real CLI, real local git, no network)', () => {
   let sandbox: string;
   let homeDir: string;
   let dshRemote: string;
@@ -173,38 +196,35 @@ describe('DSH Team Context v0 e2e (real CLI, real local git, no network)', () =>
     if (sandbox) fs.rmSync(sandbox, { recursive: true, force: true });
   });
 
-  it('1. initial pull materializes skill + rule + governance', async () => {
+  it('1. initial pull materializes skill + governance', async () => {
     const res = await runCLI(['pull', '--force'], { HOME: homeDir }, sandbox);
     expect(res.code, res.output).toBe(0);
 
     expect(fs.existsSync(path.join(homeDir, '.claude', 'skills', 'incident-response', 'SKILL.md'))).toBe(true);
-    expect(fs.readFileSync(path.join(homeDir, '.claude', 'rules', 'security-baseline.md'), 'utf-8'))
-      .toContain('Always rotate credentials after an incident.');
     const claudeMd = fs.readFileSync(path.join(homeDir, '.claude', 'CLAUDE.md'), 'utf-8');
     expect(claudeMd).toContain('Team Context Governance');
     expect(claudeMd).toContain(GOVERNANCE_MD.trim());
   });
 
-  it('2. an upstream content update propagates on the next pull', async () => {
-    writeDshFixture(dshRemote, { ruleContent: RULE_MD_UPDATED });
-    commitAll(dshRemote, 'update rule');
+  it('2. an upstream skill content update propagates on the next pull', async () => {
+    writeDshFixture(dshRemote, { skillContent: SKILL_MD_UPDATED });
+    commitAll(dshRemote, 'update skill');
 
     const res = await runCLI(['pull', '--force'], { HOME: homeDir }, sandbox);
     expect(res.code, res.output).toBe(0);
 
-    expect(fs.readFileSync(path.join(homeDir, '.claude', 'rules', 'security-baseline.md'), 'utf-8'))
-      .toContain('UPDATED: rotate credentials within 1 hour.');
+    expect(fs.readFileSync(path.join(homeDir, '.claude', 'skills', 'incident-response', 'SKILL.md'), 'utf-8'))
+      .toContain('UPDATED: escalate within 15 minutes');
   });
 
-  it('3. an upstream deletion tombstones the canonical skill + rule locally', async () => {
-    writeDshFixture(dshRemote, { includeSkillAndRule: false });
-    commitAll(dshRemote, 'remove skill and rule upstream');
+  it('3. an upstream deletion tombstones the canonical skill locally', async () => {
+    writeDshFixture(dshRemote, { includeSkill: false });
+    commitAll(dshRemote, 'remove skill upstream');
 
     const res = await runCLI(['pull', '--force'], { HOME: homeDir }, sandbox);
     expect(res.code, res.output).toBe(0);
 
     expect(fs.existsSync(path.join(homeDir, '.claude', 'skills', 'incident-response'))).toBe(false);
-    expect(fs.existsSync(path.join(homeDir, '.claude', 'rules', 'security-baseline.md'))).toBe(false);
     // Governance is untouched by this step — still present.
     expect(fs.readFileSync(path.join(homeDir, '.claude', 'CLAUDE.md'), 'utf-8')).toContain(GOVERNANCE_MD.trim());
   });
@@ -224,11 +244,11 @@ describe('DSH Team Context v0 e2e (real CLI, real local git, no network)', () =>
     expect(restored).not.toContain(GOVERNANCE_TAMPERED_MARKER);
   });
 
-  it('5. push --dry-run never picks up canonical skill/rule content', async () => {
-    // Re-publish the skill + rule so there is canonical content on disk to
+  it('5. push --dry-run never picks up canonical skill content', async () => {
+    // Re-publish the skill so there is canonical content on disk to
     // (incorrectly) surface as a push candidate if the exclusion regressed.
     writeDshFixture(dshRemote);
-    commitAll(dshRemote, 're-add skill and rule');
+    commitAll(dshRemote, 're-add skill');
     const pullRes = await runCLI(['pull', '--force'], { HOME: homeDir }, sandbox);
     expect(pullRes.code, pullRes.output).toBe(0);
     expect(fs.existsSync(path.join(homeDir, '.claude', 'skills', 'incident-response', 'SKILL.md'))).toBe(true);
@@ -236,26 +256,40 @@ describe('DSH Team Context v0 e2e (real CLI, real local git, no network)', () =>
     const pushRes = await runCLI(['push', '--dry-run'], { HOME: homeDir }, sandbox);
     expect(pushRes.code, pushRes.output).toBe(0);
     expect(pushRes.output).not.toContain('incident-response');
-    expect(pushRes.output).not.toContain('security-baseline');
     expect(pushRes.output).toContain('No new or modified resources to push');
   });
 
   it('6. an invalid schemaVersion fails loud and leaves the previous valid state untouched', async () => {
-    const ruleBefore = fs.readFileSync(path.join(homeDir, '.claude', 'rules', 'security-baseline.md'), 'utf-8');
-    const skillBefore = fs.existsSync(path.join(homeDir, '.claude', 'skills', 'incident-response', 'SKILL.md'));
+    const skillBefore = fs.readFileSync(path.join(homeDir, '.claude', 'skills', 'incident-response', 'SKILL.md'), 'utf-8');
     const claudeMdBefore = fs.readFileSync(path.join(homeDir, '.claude', 'CLAUDE.md'), 'utf-8');
 
-    writeDshFixture(dshRemote, { schemaVersion: 2, ruleContent: RULE_MD_INVALID });
+    writeDshFixture(dshRemote, { schemaVersion: 2, skillContent: SKILL_MD_INVALID });
     commitAll(dshRemote, 'bump to unsupported schema version');
 
     const res = await runCLI(['pull', '--force'], { HOME: homeDir }, sandbox);
     expect(res.code, res.output).toBe(0); // pull as a whole still succeeds; only this step is refused
     expect(res.output).toContain('unsupported schemaVersion');
 
-    const ruleAfter = fs.readFileSync(path.join(homeDir, '.claude', 'rules', 'security-baseline.md'), 'utf-8');
-    expect(ruleAfter).toBe(ruleBefore);
-    expect(ruleAfter).not.toContain('THIS MUST NEVER LAND LOCALLY');
-    expect(fs.existsSync(path.join(homeDir, '.claude', 'skills', 'incident-response', 'SKILL.md'))).toBe(skillBefore);
+    const skillAfter = fs.readFileSync(path.join(homeDir, '.claude', 'skills', 'incident-response', 'SKILL.md'), 'utf-8');
+    expect(skillAfter).toBe(skillBefore);
+    expect(skillAfter).not.toContain('THIS MUST NEVER LAND LOCALLY');
+    expect(fs.readFileSync(path.join(homeDir, '.claude', 'CLAUDE.md'), 'utf-8')).toBe(claudeMdBefore);
+  });
+
+  it('7. an unknown top-level manifest field fails loud the same way', async () => {
+    const skillBefore = fs.readFileSync(path.join(homeDir, '.claude', 'skills', 'incident-response', 'SKILL.md'), 'utf-8');
+    const claudeMdBefore = fs.readFileSync(path.join(homeDir, '.claude', 'CLAUDE.md'), 'utf-8');
+
+    writeDshFixture(dshRemote, { manifestExtra: 'rules: true\n', skillContent: SKILL_MD_INVALID });
+    commitAll(dshRemote, 'declare an unrecognized manifest field');
+
+    const res = await runCLI(['pull', '--force'], { HOME: homeDir }, sandbox);
+    expect(res.code, res.output).toBe(0);
+    expect(res.output).toContain('unknown top-level field');
+
+    const skillAfter = fs.readFileSync(path.join(homeDir, '.claude', 'skills', 'incident-response', 'SKILL.md'), 'utf-8');
+    expect(skillAfter).toBe(skillBefore);
+    expect(skillAfter).not.toContain('THIS MUST NEVER LAND LOCALLY');
     expect(fs.readFileSync(path.join(homeDir, '.claude', 'CLAUDE.md'), 'utf-8')).toBe(claudeMdBefore);
   });
 });

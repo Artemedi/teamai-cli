@@ -391,8 +391,8 @@ export class SkillsHandler extends ResourceHandler {
     // never push them back as if they were team-authored.
     let teamContextSkillNames: Set<string>;
     try {
-      const { getTeamContextItemNames } = await import('../team-context.js');
-      teamContextSkillNames = await getTeamContextItemNames(teamConfig, 'skills');
+      const { getTeamContextSkillNames } = await import('../team-context.js');
+      teamContextSkillNames = await getTeamContextSkillNames(teamConfig);
     } catch {
       teamContextSkillNames = new Set();
     }

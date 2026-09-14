@@ -1695,11 +1695,9 @@ export async function pull(options: GlobalOptions): Promise<void> {
     }
   }
 
-  // 5.5. Materialize the DSH Team Context (canonical, read-only), if the team
-  // configured one. Deliberately runs AFTER pullForScope's per-scope resource
-  // sync above (and after the peer-source pull), so a same-named canonical
-  // rule deterministically overwrites a same-named team rule at its tool-dir
-  // location ("canonical wins" for rules — see team-context.ts). Same
+  // 5.5. Materialize the DSH Team Context (canonical, read-only skills +
+  // governance), if the team configured one. Runs after pullForScope's
+  // per-scope resource sync above (and after the peer-source pull), same
   // contention-filtered scope as step 5, for the same reason.
   if (sourceConfig) {
     try {
