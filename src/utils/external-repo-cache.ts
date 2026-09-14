@@ -5,17 +5,19 @@ import { log, spinner } from './logger.js';
 import { pathExists, ensureDir } from './fs.js';
 
 /**
- * "External read-only repo mirror" primitives, extracted because two
- * concrete features currently need exactly this: cross-team `sources`
+ * Clone-or-pull-with-TTL for an external read-only repo mirror, extracted
+ * because two concrete features currently call it: cross-team `sources`
  * (source.ts) and the DSH Team Context adapter (team-context.ts). Both
- * clone-or-pull an external repo with a TTL and never write back to it;
- * `team-context.ts` additionally needs a name-set diff for tombstone-style
- * cleanup (`source.ts` computes its own tombstone diff inline and has not
- * been touched here). This is deliberately not a general "external
- * repository framework" — there is no plan to add a third caller, and if one
- * shows up, extend this file then, not in anticipation now. Everything
- * entity-specific (what a "skill" is, collision policy, manifest shape)
- * stays in the caller.
+ * clone-or-pull an external repo with a TTL and never write back to it.
+ *
+ * There is deliberately no name-set-diff helper here anymore: it had exactly
+ * one real caller (team-context.ts's skill tombstone cleanup), and
+ * `source.ts` computes its own separate inline tombstone diff rather than
+ * using a shared helper — so there was no actual cross-consumer duplication
+ * to remove. That diff now lives directly in team-context.ts. This file is
+ * deliberately not a general "external repository framework" — there is no
+ * plan to add a third caller, and if one shows up, extend this file then,
+ * not in anticipation now.
  *
  * Not to be confused with `repo-cache.ts` (import command's LAST_SYNC cache
  * for `teamai import`), which is an unrelated, pre-existing cache keyed by
@@ -84,34 +86,4 @@ export async function ensureRepoCache(
     log.warn(`[${label}] Clone failed: ${(e as Error).message}`);
     return null;
   }
-}
-
-/** Set-diff result: names newly present, names no longer present, unchanged. */
-export interface NameSetDiff {
-  added: string[];
-  removed: string[];
-  unchanged: string[];
-}
-
-/**
- * Diff two name sets (e.g. "previously deployed" vs "currently resolved
- * upstream"). Used to drive tombstone-style local cleanup: `removed` is what
- * the caller should delete locally, `added`/`unchanged` is what should exist.
- */
-export function diffNameSets(previous: Iterable<string>, current: Iterable<string>): NameSetDiff {
-  const previousSet = new Set(previous);
-  const currentSet = new Set(current);
-  const added: string[] = [];
-  const unchanged: string[] = [];
-  const removed: string[] = [];
-
-  for (const name of currentSet) {
-    if (previousSet.has(name)) unchanged.push(name);
-    else added.push(name);
-  }
-  for (const name of previousSet) {
-    if (!currentSet.has(name)) removed.push(name);
-  }
-
-  return { added, removed, unchanged };
 }

@@ -34,28 +34,7 @@ vi.mock('../providers/index.js', () => ({
   })),
 }));
 
-import { ensureRepoCache, diffNameSets } from '../utils/external-repo-cache.js';
-
-describe('diffNameSets', () => {
-  it('classifies added, removed, and unchanged names', () => {
-    const result = diffNameSets(['a', 'b'], ['b', 'c']);
-    expect(result.added).toEqual(['c']);
-    expect(result.removed).toEqual(['a']);
-    expect(result.unchanged).toEqual(['b']);
-  });
-
-  it('handles empty previous (everything is added)', () => {
-    const result = diffNameSets([], ['a', 'b']);
-    expect(result.added.sort()).toEqual(['a', 'b']);
-    expect(result.removed).toEqual([]);
-  });
-
-  it('handles empty current (everything is removed)', () => {
-    const result = diffNameSets(['a', 'b'], []);
-    expect(result.removed.sort()).toEqual(['a', 'b']);
-    expect(result.added).toEqual([]);
-  });
-});
+import { ensureRepoCache } from '../utils/external-repo-cache.js';
 
 describe('ensureRepoCache', () => {
   let tmpDir: string;

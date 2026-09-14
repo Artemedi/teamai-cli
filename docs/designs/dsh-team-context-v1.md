@@ -28,7 +28,7 @@ into it, no write path, no silent local override of governance.
 | 6 | Skills collision | Local team skill wins; canonical copy skipped, **observably** (logged + reflected in the adapter's own manifest) | Team-authored content must not be silently shadowed by canonical content |
 | 7 | Governance | Always fully regenerated into its own CLAUDE.md block; no config flag anywhere disables or shadows it | This is the availability-vs-authority split (dsh-team-context ADR-0007): Team Context unavailable degrades gracefully and never blocks boot; Team Context configured-and-resolved makes governance authoritative and non-shadowable. Neither half weakens the other |
 | 8 | Learnings | Deferred entirely (not part of v1) | Curated cross-team learnings need their own resolution semantics; scope was cut to ship skills/governance first |
-| 9 | Shared primitives | `ensureRepoCache` (clone/pull-with-TTL) lives in `utils/external-repo-cache.ts`, called by both `source.ts` and `team-context.ts`. `diffNameSets` lives there too and is called by `team-context.ts`; `source.ts` keeps its own inline tombstone diff, not migrated | Extracted because a concrete second consumer (`team-context.ts`) exists and calls each one today — see "Why shared helpers are feature-driven" below |
+| 9 | Shared primitives | `ensureRepoCache` (clone/pull-with-TTL) lives in `utils/external-repo-cache.ts`, called by both `source.ts` and `team-context.ts`. The skill tombstone name-set diff is feature-local code inside `team-context.ts` — `source.ts` computes its own separate inline diff and was not migrated | Shared only where two real consumers exist today; kept feature-local where only one does — see "Shared abstraction" below |
 | 10 | Atomicity | Resolve the full snapshot (skills + governance + schema check) in memory before any local write | An invalid/incompatible upstream must never leave partial or tombstoned local state |
 
 ### Config shape: `teamContext:` vs a typed `sources` entry
@@ -73,34 +73,43 @@ decision; it only shrank `team-context.ts` itself (~350 lines, no rules
 branch). The decision stands for the same code-level reasons, not because
 it shipped first.
 
-### Why shared external-repo helpers are feature-driven, not a pre-extracted framework
+### Shared abstraction: what actually justifies it
 
 An early version of this integration was proposed upstream as a standalone
 refactor PR that extracted `ensureRepoCache` / `diffNameSets` /
 `getLocalTeamSkillNames` / `removeSkillFromToolPaths` out of `source.ts`
 *before* any second caller of them existed in the codebase — `diffNameSets`
-in particular had zero production callers at that point. That's premature
-abstraction: it optimizes for a hypothetical future integration instead of a
-real one, and nobody can tell from the code alone whether the shared shape
-actually fits a second use case until one exists.
+in particular had zero production callers at that point. External review
+flagged this; the decision below is our own engineering conclusion drawn
+from it, not an upstream requirement we're deferring to:
 
-Our own conclusion, not an upstream requirement: a helper only stays shared
-if a concrete, currently-merged consumer calls it in production code today.
-Re-checked against the current tree:
+> **Shared abstraction is justified by existing multiple consumers or actual
+> duplicated behavior. A helper with only one current production consumer
+> stays local until a second real consumer creates duplication.** A single
+> current caller is not sufficient by itself — the question is not "is this
+> called from production code," but "does sharing it remove real duplication
+> between consumers that exist right now."
+
+Re-checked against the current tree with that bar:
 
 | helper | production callers | keep shared? |
 |---|---|---|
-| `ensureRepoCache` | `source.ts` (`ensureSourceRepo`), `team-context.ts` (`syncTeamContext`) | yes — two real callers |
+| `ensureRepoCache` | `source.ts` (`ensureSourceRepo`), `team-context.ts` (`syncTeamContext`) | yes — two real callers, same clone/pull/TTL logic previously duplicated |
 | `getLocalTeamSkillNames` | `source.ts` (`pullSource`), `team-context.ts` (`materializeTeamContext`) | yes — two real callers |
 | `removeSkillFromToolPaths` | `source.ts` (2 call sites), `team-context.ts` (`materializeTeamContext`) | yes — two real callers |
-| `diffNameSets` | `team-context.ts` (`materializeTeamContext`'s skill tombstone diff) | yes — one real, current caller; `source.ts` still computes its own tombstone diff inline and was deliberately not migrated to it (out of scope, working code, not touched) |
+| `diffNameSets` | was: `team-context.ts` only; `source.ts` computes a separate inline tombstone diff and was never migrated to it | **no** — one caller does not meet the bar. Inlined directly into `team-context.ts`'s `materializeTeamContext` (a 2-line `Set` filter) and removed as a shared export; its standalone-only tests were removed with it |
 
-All four are kept because Team Context is now that concrete second consumer,
-not because they were inherited from a prior refactor. If a helper had zero
-current callers, it would be deleted, not kept "for later" — see
-`utils/external-repo-cache.ts`'s module comment, which says explicitly there
-is no plan for a third caller and a real one should be extended for when it
-exists, not anticipated now.
+Three of the four survive because a second real consumer duplicated the same
+logic *before* the helper existed. `diffNameSets` didn't meet that bar even
+after Team Context became a real consumer — one caller alone doesn't
+retroactively justify a shared module, because `source.ts` never actually
+duplicated that shape; it does its own thing. Not creating a false second
+caller by migrating `source.ts`'s working, tested inline diff just to
+retroactively justify the abstraction — that would be backwards (abstraction
+should follow real duplication, not the reverse). If a genuine third need for
+this diff shape appears later, re-extract it then, against the actual
+duplication that exists at that point — see `utils/external-repo-cache.ts`'s
+module comment, which says explicitly there is no plan for a third caller.
 
 ## Architecture
 
