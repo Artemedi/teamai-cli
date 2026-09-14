@@ -699,9 +699,11 @@ servers:
     args: ['-y', '@acme/formatter-mcp']
     env:
       FORMATTER_MODE: strict
-    requires: [npx]                      # npx 不存在时跳过并提示
+    requires: [npx]                      # PATH 上找不到 npx 时跳过并提示
     tools: [claude, cursor]              # 可选；默认所有支持 MCP 的工具
 ```
+
+`requires` 从 `PATH` 解析。Windows 上还会匹配 `PATHEXT` 后缀（`uvx` 可匹配 `uvx.exe` / `uvx.cmd`）。
 
 各工具的落点：
 
@@ -1472,6 +1474,30 @@ teamai source remove-http
 
 HTTP 源通过 hook dispatch 在每次 session 中上报状态并拉取 skill 指令。每个安装仅支持一个 HTTP 源。若主仓本身已是 HTTP 模式（`init --http`），则 `add-http` 不可用（主仓已占用 HTTP 配置）。
 
+### DSH Team Context（canonical，只读）
+
+`teamai.yaml` 中的 `teamContext` 指向一个 canonical 的、组织级 DSH Team Context 仓库。与 `sources`（按 skill 通过 `publicSkills` 逐个 opt-in、平级团队、任何冲突都本地优先）不同，Team Context 仓库默认可信：其 `skills/`、`governance/` 目录下的全部内容都被视为已发布的 canonical 内容，无需 allow-list。不存在 canonical 的 `rules/` 目录——DSH Team Context 的 provider contract 有意不发布这一实体；某个运行时特有的 rule/policy 呈现形式（CLAUDE.md 区块、`.cursor/rules` 文件等）是消费方对 `governance/` 内容做的*投影*，不是 Team Context 自身的独立实体。TeamAI 自有的、团队自行编写的 `rules/` 能力与 Team Context 无关，行为完全不变。
+
+```yaml
+teamContext:
+  repo: https://github.com/acme/dsh-team-context.git
+```
+
+Team Context 仓库自身必须在根目录发布一份声明契约版本的 `team-context.yaml`：
+
+```yaml
+schemaVersion: 1
+```
+
+`teamai pull` 会克隆/刷新该仓库（与 `sources` 相同的 TTL 缓存、只读模式），并将其物化到本地。这完全是**只读、单向（Team Context → teamai）**的——没有任何命令会向它推送或提出变更。各类内容的冲突处理策略并不相同：
+
+- **Skills** —— 本地团队自有的同名 skill 优先；canonical 副本会被跳过，且这一覆盖行为会被记录（`teamai pull` 会打印出来，不是静默的）。
+- **Governance**（`governance/*.md`）—— 编译进一个专用的、每次都会被完全重新生成的 CLAUDE.md 区块。团队级或本地配置中都没有任何开关可以禁用或遮蔽它；每次 `teamai pull` 都会用上游仓库当前内容重新校准它。这一约束仅在 Team Context 被配置且成功解析之后才成立——若不可达、过期或未配置，`teamai` 会按预期优雅降级，其余功能照常工作。
+
+上游 `team-context.yaml` 的 schemaVersion 无效或不受支持、或者 manifest 声明了无法识别的顶层字段时，都会明确报错失败，且绝不会被部分应用——在上游修复之前，上一次 pull 物化的 skills、governance 会原样保留。
+
+跨团队的精选 learnings 属于 deferred。`teamContext` 字段本身的修改和 `teamai.yaml` 里其它字段一样，走团队级配置变更流程（需要经过 `teamai push` 审核）——目前尚未让这个字段具备"防止本地团队成员移除或改指向"的强制力。
+
 ---
 
 ## 配置文件参考
@@ -1487,6 +1513,9 @@ provider: github
 
 reviewers:
   - reviewer1
+
+teamContext:                      # 可选；canonical、组织级 DSH Team Context（只读）
+  repo: https://github.com/acme/dsh-team-context.git
 
 packages:
   npm:

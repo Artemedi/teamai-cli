@@ -248,6 +248,53 @@ async function scanSkillsRecursively(dirPath: string): Promise<Map<string, strin
   return results;
 }
 
+/**
+ * Get the set of skill names that belong to the local team (team repo +
+ * CLI built-ins). Shared by every feature that must not overwrite/shadow a
+ * team-authored skill, such as cross-team `sources` (source.ts). Deliberately
+ * independent of any one caller — no caller owns this helper.
+ */
+export async function getLocalTeamSkillNames(teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<Set<string>> {
+  const items = await new SkillsHandler().scanTeamForPull(teamConfig, localConfig);
+  const names = new Set(items.map((i) => i.name));
+  // Also include builtin skills
+  for (const name of BUILTIN_SKILL_NAMES) {
+    names.add(name);
+  }
+  return names;
+}
+
+/**
+ * Remove a skill from all tool paths. Shared by any read-only external
+ * integration (e.g. `sources`) for cleaning up a skill IT deployed (never a
+ * team-authored one) — neither the team repo nor any tombstone is touched
+ * here.
+ */
+export async function removeSkillFromToolPaths(
+  skillName: string,
+  teamConfig: TeamaiConfig,
+  localConfig: LocalConfig,
+  baseDir: string,
+  installedPaths?: string[],
+): Promise<void> {
+  if (installedPaths) {
+    for (const installedPath of installedPaths) {
+      const skillDir = path.resolve(baseDir, installedPath);
+      assertWithinRoot(baseDir, skillDir);
+      if (await pathExists(skillDir)) await remove(skillDir);
+    }
+    return;
+  }
+
+  for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
+    if (!toolPath.skills) continue;
+    const skillDir = path.join(baseDir, toolPath.skills, skillName);
+    if (await pathExists(skillDir)) {
+      await remove(skillDir);
+    }
+  }
+}
+
 export class SkillsHandler extends ResourceHandler {
   readonly type = 'skills' as const;
 
@@ -340,6 +387,16 @@ export class SkillsHandler extends ResourceHandler {
       sourceSkillNames = new Set();
     }
 
+    // Canonical DSH Team Context skills are read-only, materialized copies —
+    // never push them back as if they were team-authored.
+    let teamContextSkillNames: Set<string>;
+    try {
+      const { getTeamContextSkillNames } = await import('../team-context.js');
+      teamContextSkillNames = await getTeamContextSkillNames(teamConfig);
+    } catch {
+      teamContextSkillNames = new Set();
+    }
+
     // Collect the best candidate for each skill name across all tool directories
     const candidates = new Map<string, { sourcePath: string; mtime: number; status: ResourceItemStatus; namespace?: string }>();
 
@@ -358,6 +415,7 @@ export class SkillsHandler extends ResourceHandler {
         if (blockedSkills.has(dir)) continue; // Skip skills in non-allowed namespaces
         if (BUILTIN_SKILL_NAMES.has(dir)) continue; // Skip CLI built-in skills
         if (sourceSkillNames.has(dir)) continue; // Skip cross-team source skills
+        if (teamContextSkillNames.has(dir)) continue; // Skip canonical DSH Team Context skills
 
         if (teamSkills.has(dir)) {
           // Skill exists in team repo — check if content differs

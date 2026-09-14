@@ -212,6 +212,79 @@ export const SOURCE_PULL_TTL_MS = 24 * 60 * 60 * 1000;
 
 export const TEAMAI_SOURCES_DIR = path.join(getUserHome(), '.teamai', 'sources');
 
+// ─── DSH Team Context (canonical, read-only) ──────────────
+//
+//  Data flow (v1: read-only, DSH → TeamAI, no allow-list — everything under
+//  skills/, governance/ in the DSH repo is canonical published content;
+//  team-context.yaml is a contract/version file, not a filter). There is no
+//  canonical `rules/` entity — the provider's own contract (dsh-team-context
+//  ADR-0006) deliberately does not publish one; a runtime-specific rule/policy
+//  surface is a consumer-side projection of `governance/`, not something this
+//  adapter materializes as a distinct entity:
+//
+//  DSH Team Context repo                    teamai.yaml (consumer team)
+//    team-context.yaml                        teamContext:
+//      schemaVersion: 1                          repo: <git-url>
+//    skills/<name>/SKILL.md
+//    governance/*.md
+//            │                                        │
+//            │              teamai pull                │
+//            ▼                                         ▼
+//  ~/.teamai/team-context/<hash>/repo/  ← git clone (read-only, never pushed to)
+//  ~/.teamai/team-context/<hash>/installed.json ← manifest
+//            │
+//            ▼
+//  skills: local team skill of the same name wins (observable — logged +
+//          recorded as skipped in the manifest)
+//  governance: always regenerated in full into a dedicated, non-optional
+//          CLAUDE.md block — no local config can disable or shadow it
+
+export const TeamContextConfigSchema = z.object({
+  /** Git remote URL of the canonical DSH Team Context repo. */
+  repo: z.string().min(1),
+});
+
+export type TeamContextConfig = z.infer<typeof TeamContextConfigSchema>;
+
+/**
+ * Contract version teamai supports for the DSH Team Context repo's own
+ * `team-context.yaml` (declared at that repo's root, not in teamai.yaml).
+ * An upstream repo declaring any other value, or declaring any top-level
+ * field this version doesn't know about, fails loud and is never
+ * materialized (see resolveTeamContextSnapshot in team-context.ts).
+ */
+export const TEAM_CONTEXT_SCHEMA_VERSION = 1;
+
+/**
+ * Top-level fields the v1 contract recognizes in the upstream repo's
+ * `team-context.yaml`. Anything else present fails loud rather than being
+ * silently ignored, so a future provider-side field can never be
+ * misinterpreted by an older consumer.
+ */
+export const TEAM_CONTEXT_KNOWN_MANIFEST_FIELDS = new Set(['schemaVersion']);
+
+/** TTL for the Team Context repo pull: don't re-pull within this duration (ms). */
+export const TEAM_CONTEXT_PULL_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Installed-content manifest for the DSH Team Context adapter. Persisted to
+ * `~/.teamai/team-context/<hash>/installed.json`. Deliberately separate from
+ * `SourceInstallManifest` — team-context has its own collision policy per
+ * entity type and also tracks governance, which peer `sources` don't support.
+ */
+export interface TeamContextInstallManifest {
+  /** ISO timestamp of last successful pull. */
+  lastPull: string;
+  /** Contract version of the upstream repo as of this pull. */
+  schemaVersion: number;
+  /** Canonical skill names actually deployed (excludes any skipped by local override). */
+  skills: string[];
+  /** Per-skill deployment paths, relative to the configured scope root. */
+  skillPaths?: Record<string, string[]>;
+  /** Canonical governance file names last compiled into the CLAUDE.md block. */
+  governanceFiles: string[];
+}
+
 export const TeamaiConfigSchema = z.object({
   team: z.string(),
   description: z.string().default(''),
@@ -236,6 +309,15 @@ export const TeamaiConfigSchema = z.object({
   publicSkills: z.array(z.string()).optional(),
   /** External team repos to pull skills from. Managed by team admin. */
   sources: z.array(SourceConfigSchema).optional(),
+  /**
+   * The canonical DSH Team Context repo (org-wide shared skills/governance).
+   * Team-level config only — deliberately not overridable from
+   * per-user local config, since governance must not be locally disableable.
+   * v1 hardening gap: a team admin editing THIS field (e.g. removing it, or
+   * pointing it at a different repo) still works — that channel is not yet
+   * admin-enforced. Only per-user/local-config shadowing is closed in v1.
+   */
+  teamContext: TeamContextConfigSchema.optional(),
   sharing: SharingConfigSchema.default({}),
   /** Team-level default: whether `teamai update` auto-installs upgrades. Users
    * can override via `updatePolicy` in local config. Undefined = team has no
@@ -746,6 +828,16 @@ export const TEAMAI_CLAUDEMD_END = '<!-- [teamai:claudemd:end] -->';
 // Phase 1: marker section for the recall-subagent rules block injected by `teamai pull`.
 export const TEAMAI_RECALL_RULES_START = '<!-- [teamai:recall-rules:start] -->';
 export const TEAMAI_RECALL_RULES_END = '<!-- [teamai:recall-rules:end] -->';
+
+/**
+ * DSH Team Context governance block. Unlike every other CLAUDE.md section
+ * here, there is no config path that skips this injection when `teamContext`
+ * is configured — see team-context.ts's injectGovernanceBlock. The block is
+ * always fully regenerated from upstream `governance/*.md`, so a manual edit
+ * inside these markers never survives the next `teamai pull`.
+ */
+export const TEAMAI_TEAM_CONTEXT_GOVERNANCE_START = '<!-- [teamai:team-context-governance:start] -->';
+export const TEAMAI_TEAM_CONTEXT_GOVERNANCE_END = '<!-- [teamai:team-context-governance:end] -->';
 
 // ─── Usage tracking ────────────────────────────────────
 
