@@ -28,7 +28,7 @@ into it, no write path, no silent local override of governance.
 | 6 | Skills collision | Local team skill wins; canonical copy skipped, **observably** (logged + reflected in the adapter's own manifest) | Team-authored content must not be silently shadowed by canonical content |
 | 7 | Governance | Always fully regenerated into its own CLAUDE.md block; no config flag anywhere disables or shadows it | This is the availability-vs-authority split (dsh-team-context ADR-0007): Team Context unavailable degrades gracefully and never blocks boot; Team Context configured-and-resolved makes governance authoritative and non-shadowable. Neither half weakens the other |
 | 8 | Learnings | Deferred entirely (not part of v1) | Curated cross-team learnings need their own resolution semantics; scope was cut to ship skills/governance first |
-| 9 | Shared primitives | Clone/pull-with-TTL and name-set diffing extracted into `utils/external-repo-cache.ts`, reused by both `source.ts` (peer sources) and `team-context.ts` | Avoid duplicating the same clone/TTL/diff logic a second time |
+| 9 | Shared primitives | `ensureRepoCache` (clone/pull-with-TTL) lives in `utils/external-repo-cache.ts`, called by both `source.ts` and `team-context.ts`. `diffNameSets` lives there too and is called by `team-context.ts`; `source.ts` keeps its own inline tombstone diff, not migrated | Extracted because a concrete second consumer (`team-context.ts`) exists and calls each one today — see "Why shared helpers are feature-driven" below |
 | 10 | Atomicity | Resolve the full snapshot (skills + governance + schema check) in memory before any local write | An invalid/incompatible upstream must never leave partial or tombstoned local state |
 
 ### Config shape: `teamContext:` vs a typed `sources` entry
@@ -61,6 +61,46 @@ field:
 - **Backward compatible.** `sources`'s existing flat shape and every
   call site that treats `SourceConfig[]` as homogeneous stays exactly as it
   is; nothing needs a `kind` guard retrofitted onto it.
+
+**Re-confirmed after removing canonical `rules/` and auditing every shared
+helper for real callers (see below):** none of the four arguments above
+depend on how many entity types Team Context materializes. Cardinality
+(one canonical plane vs. an array of peer teams), the trust/collision-policy
+mismatch, and `sources`' call-site backward compatibility are properties of
+the *config shape*, not of whether the entity is skills+governance or
+skills+rules+governance. Shrinking the feature didn't change the config
+decision; it only shrank `team-context.ts` itself (~350 lines, no rules
+branch). The decision stands for the same code-level reasons, not because
+it shipped first.
+
+### Why shared external-repo helpers are feature-driven, not a pre-extracted framework
+
+An early version of this integration was proposed upstream as a standalone
+refactor PR that extracted `ensureRepoCache` / `diffNameSets` /
+`getLocalTeamSkillNames` / `removeSkillFromToolPaths` out of `source.ts`
+*before* any second caller of them existed in the codebase — `diffNameSets`
+in particular had zero production callers at that point. That's premature
+abstraction: it optimizes for a hypothetical future integration instead of a
+real one, and nobody can tell from the code alone whether the shared shape
+actually fits a second use case until one exists.
+
+Our own conclusion, not an upstream requirement: a helper only stays shared
+if a concrete, currently-merged consumer calls it in production code today.
+Re-checked against the current tree:
+
+| helper | production callers | keep shared? |
+|---|---|---|
+| `ensureRepoCache` | `source.ts` (`ensureSourceRepo`), `team-context.ts` (`syncTeamContext`) | yes — two real callers |
+| `getLocalTeamSkillNames` | `source.ts` (`pullSource`), `team-context.ts` (`materializeTeamContext`) | yes — two real callers |
+| `removeSkillFromToolPaths` | `source.ts` (2 call sites), `team-context.ts` (`materializeTeamContext`) | yes — two real callers |
+| `diffNameSets` | `team-context.ts` (`materializeTeamContext`'s skill tombstone diff) | yes — one real, current caller; `source.ts` still computes its own tombstone diff inline and was deliberately not migrated to it (out of scope, working code, not touched) |
+
+All four are kept because Team Context is now that concrete second consumer,
+not because they were inherited from a prior refactor. If a helper had zero
+current callers, it would be deleted, not kept "for later" — see
+`utils/external-repo-cache.ts`'s module comment, which says explicitly there
+is no plan for a third caller and a real one should be extended for when it
+exists, not anticipated now.
 
 ## Architecture
 
