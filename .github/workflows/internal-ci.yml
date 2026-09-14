@@ -2,10 +2,12 @@ name: Internal CI
 
 # Minimal CI for our own fork (Artemedi/teamai-cli), independent of the
 # inherited upstream `ci.yml`/`release.yml` (which target Tencent's release
-# process and, as of this writing, have never been enabled for this fork —
-# GitHub disables Actions on a repo's workflows by default for a freshly
-# forked repository until a repo owner manually enables them from the
-# Actions tab; there is no public REST/CLI API to do that on their behalf).
+# process, not ours). Before this file was added, GitHub reported zero
+# registered workflows for this fork (`actions/workflows` returned an empty
+# list, and `gh workflow enable ci.yml` 404'd) even though ci.yml/release.yml
+# existed in the tree — the standard fork-safety gate that disables inherited
+# workflows until a repo owner acts on them. Adding/pushing this new workflow
+# is what caused GitHub to register and start running workflows for this repo.
 #
 # Scope is deliberately small: typecheck, unit tests, build, and the Team
 # Context E2E suite (real built CLI, real local git, no network) — the
@@ -50,4 +52,14 @@ jobs:
         run: npm run build
 
       - name: Team Context E2E
-        run: npx vitest --config vitest.e2e.config.ts run src/__tests__/team-context-e2e.test.ts
+        # Conditional: the Team Context consumer feature (and its E2E suite)
+        # doesn't exist on every branch this workflow runs against yet — e.g.
+        # this file is absent on `main` until that feature merges. Skip
+        # rather than fail so this workflow is usable both before and after
+        # that merge, instead of hardcoding a file that may not exist.
+        run: |
+          if [ -f src/__tests__/team-context-e2e.test.ts ]; then
+            npx vitest --config vitest.e2e.config.ts run src/__tests__/team-context-e2e.test.ts
+          else
+            echo "src/__tests__/team-context-e2e.test.ts not present on this ref; skipping."
+          fi
